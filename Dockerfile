@@ -1,11 +1,19 @@
 FROM python:3.11-slim
 
 COPY app /app
-RUN python -m pip install /app --extra-index-url https://www.piwheels.org/simple
+# Build deps are needed to compile uvloop (via litestar[standard]) on armv7 when no
+# prebuilt wheel is available. They are purged in the same layer to keep the image small.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential autoconf automake libtool pkg-config \
+ && python -m pip install /app --extra-index-url https://www.piwheels.org/simple \
+ && apt-get purge -y build-essential autoconf automake libtool pkg-config \
+ && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 8000/tcp
 
-LABEL version="0.0.3"
+LABEL version="0.0.5"
 
 LABEL permissions='\
 {\

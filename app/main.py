@@ -210,6 +210,7 @@ class RTKController(Controller):
         self._vehicle_system_id = None  # Discovered vehicle system ID
         self._vehicle_location = None  # vehicle GPS location (lat, lon, alt) in decimal degrees and meters
         self._vehicle_location_update = 0  # system time (in sec since epoch) when vehicle location received
+        self._connection_active = False  # True once a connection establishes and starts streaming RTCM
 
     def _is_config_valid(self) -> bool:
         """Check if the current configuration is valid for connecting"""
@@ -306,10 +307,31 @@ class RTKController(Controller):
 
         self._ntrip_task = asyncio.create_task(self._ntrip_client_loop())
 
+    @staticmethod
+    def _classify_ntrip_error(error_text: str) -> str:
+        """Classify a connection error to decide the retry strategy.
+
+        Returns one of:
+          'fatal'     - configuration/credential problem; back off slowly, won't fix itself
+          'transient' - network/caster blip (timeout, reset, stall, caster startup); retry quickly
+        """
+        err = error_text.lower()
+        fatal_markers = [
+            "authentication failed",
+            "not found",          # mountpoint missing (404)
+            "access forbidden",   # 403
+            "not configured",
+        ]
+        if any(marker in err for marker in fatal_markers):
+            return "fatal"
+        return "transient"
+
     async def _ntrip_client_loop(self):
         """Main NTRIP client loop - retries on ALL errors and disconnections"""
-        reconnect_delay = 5  # Start with 5 seconds
-        max_reconnect_delay = 300  # Max 5 minutes
+        base_reconnect_delay = 5         # starting/fast retry delay (seconds)
+        transient_reconnect_delay = 5    # fixed fast retry for network/caster blips
+        max_reconnect_delay = 30         # cap retry delay (was 300 - too slow for RTK)
+        reconnect_delay = base_reconnect_delay
         consecutive_failures = 0
 
         print("🔄 Starting NTRIP client loop with automatic reconnection")
@@ -317,6 +339,8 @@ class RTKController(Controller):
         # Main reconnection loop - this will ALWAYS retry unless explicitly cancelled
         while True:
             connection_start_time = datetime.now()
+            # Reset before each attempt; _connect_ntrip flips this True once it streams data
+            self._connection_active = False
 
             try:
                 # Validate configuration before attempting connection
@@ -343,26 +367,41 @@ class RTKController(Controller):
                 break  # Exit the retry loop
 
             except Exception as e:
-                # ALL other exceptions trigger a retry attempt
-                consecutive_failures += 1
                 connection_duration = (datetime.now() - connection_start_time).total_seconds()
+
+                # A connection that actually established and streamed data is a success,
+                # even if it later dropped. Reset the backoff so we keep retrying quickly
+                # rather than escalating toward the cap after a brief good connection.
+                if self._connection_active:
+                    consecutive_failures = 0
+                    reconnect_delay = base_reconnect_delay
+
+                consecutive_failures += 1
 
                 # Update status to reflect the error
                 self._status.connected = False
                 self._status.error_message = str(e)
                 self._status.last_update = datetime.now().isoformat()
 
-                # Calculate exponential backoff delay
-                reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+                # Choose retry strategy based on the kind of failure
+                error_class = self._classify_ntrip_error(str(e))
+                if error_class == "fatal":
+                    # Real config/credential issue - it won't self-heal, so back off slowly
+                    reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+                else:
+                    # Network/caster blip (timeout, ECONNRESET, stall, caster startup):
+                    # retry quickly to catch the next good window from the caster
+                    reconnect_delay = transient_reconnect_delay
 
                 # Log the error and retry information
-                print(f"❌ NTRIP connection failed (attempt #{consecutive_failures})")
+                print(f"❌ NTRIP connection failed (attempt #{consecutive_failures}, {error_class})")
                 print(f"   Error: {e}")
                 print(f"   Connection duration: {connection_duration:.1f} seconds")
                 print(f"   Error type: {type(e).__name__}")
 
-                # If connection was very short, it might be a configuration issue
-                if connection_duration < 5.0 and consecutive_failures >= 3:
+                # If connection was very short and repeatedly failing on a fatal error,
+                # it's likely a configuration problem
+                if error_class == "fatal" and connection_duration < 5.0 and consecutive_failures >= 3:
                     print(f"   ⚠️  Rapid failures detected - possible configuration issue")
 
                 print(f"⏳ Retrying in {reconnect_delay:.1f} seconds...")
@@ -376,9 +415,6 @@ class RTKController(Controller):
                     self._status.last_update = datetime.now().isoformat()
                     print("🛑 NTRIP client loop cancelled during retry delay")
                     break
-
-            # Reset failure counter only after a successful connection that lasted some time
-            # (If _connect_ntrip returns normally, we'll reset it there)
 
         print("🏁 NTRIP client loop terminated")
 
@@ -415,6 +451,22 @@ class RTKController(Controller):
                     timeout=30.0  # 30 second connection timeout
                 )
                 print(f"✅ TCP connection established to {host}:{port}")
+
+                # Enable TCP keepalive so dead/idle links (e.g. flaky long-range WiFi)
+                # are detected promptly and the NAT path along the route stays warm.
+                try:
+                    sock = writer.get_extra_info('socket')
+                    if sock is not None:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                        if hasattr(socket, 'TCP_KEEPIDLE'):
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                        if hasattr(socket, 'TCP_KEEPINTVL'):
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                        if hasattr(socket, 'TCP_KEEPCNT'):
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                        print(f"✅ TCP keepalive enabled (idle 30s, intvl 10s, cnt 3)")
+                except Exception as e:
+                    print(f"⚠️  Could not enable TCP keepalive: {e}")
             except asyncio.TimeoutError:
                 raise Exception(f"Connection timeout to {host}:{port} (30 seconds)")
             except Exception as e:
@@ -529,15 +581,14 @@ class RTKController(Controller):
 
             # Mark connection as successfully established
             connection_established = True
+            self._connection_active = True  # tells the retry loop this attempt succeeded
             self._status.connected = True
             self._status.error_message = None
             self._status.last_update = datetime.now().isoformat()
             print(f"🎉 Connected to NTRIP caster, starting to receive RTCM data...")
 
-            # Reset failure counter after successful connection establishment
-            if hasattr(self, '_ntrip_client_loop'):
-                # Reset will happen in the main loop after we return successfully
-                pass
+            # Backoff reset is handled by the main loop, which checks
+            # self._connection_active (set True above) when this attempt ends.
 
             # Reset RTCM parser for new connection
             self._rtcm_parser = RTCMParser()
