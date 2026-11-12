@@ -505,7 +505,7 @@ class RTKController(Controller):
             print(f"📥 Reading server response...")
             try:
                 response = await asyncio.wait_for(reader.readline(), timeout=30.0)
-                response_str = response.decode().strip()
+                response_str = response.decode(errors="replace").strip()
                 print(f"📥 Server response: {response_str}")
             except asyncio.TimeoutError:
                 raise Exception("Timeout waiting for server response (30 seconds)")
@@ -542,18 +542,27 @@ class RTKController(Controller):
 
             print(f"✅ Authentication successful!")
 
-            # Skip remaining headers
-            print(f"📥 Reading response headers...")
-            header_count = 0
-            while True:
-                line = await reader.readline()
-                if line == b'\r\n' or line == b'\n':
-                    break
-                header_count += 1
-                if header_count <= 3:  # Show first few headers for debugging
-                    print(f"   Header: {line.decode().strip()}")
-
-            print(f"📥 Read {header_count} response headers")
+            # NTRIP v1 casters answer "ICY 200 OK" and may start streaming RTCM
+            # immediately, without headers or a blank line. Only HTTP replies carry
+            # headers, and any RTCM that arrives where a header was expected is
+            # passed on to the parser rather than decoded as text.
+            pending_data = b""
+            if response.startswith(b"ICY"):
+                print(f"📥 NTRIP v1 response; no headers to read")
+            else:
+                print(f"📥 Reading response headers...")
+                header_count = 0
+                while True:
+                    line = await asyncio.wait_for(reader.readline(), timeout=30.0)
+                    if not line or line in (b'\r\n', b'\n'):
+                        break
+                    if line[0] == 0xD3:
+                        pending_data = line
+                        break
+                    header_count += 1
+                    if header_count <= 3:  # Show first few headers for debugging
+                        print(f"   Header: {line.decode(errors='replace').strip()}")
+                print(f"📥 Read {header_count} response headers")
 
             # Mark connection as successfully established
             connection_established = True
@@ -592,7 +601,10 @@ class RTKController(Controller):
             while True:
                 try:
                     # Read data with timeout to detect stalled connections
-                    data = await asyncio.wait_for(reader.read(1024), timeout=read_timeout)
+                    if pending_data:
+                        data, pending_data = pending_data, b""
+                    else:
+                        data = await asyncio.wait_for(reader.read(1024), timeout=read_timeout)
 
                     if not data:
                         # Connection closed by server - this is a disconnect that should trigger reconnection
