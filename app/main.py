@@ -21,6 +21,13 @@ from litestar.logging import LoggingConfig
 from litestar.static_files.config import StaticFilesConfig
 from pydantic import BaseModel
 
+# Casters stream RTCM about once per second. A link that drops (for example a
+# satellite uplink losing sky view while the vehicle is submerged) usually leaves
+# a half-open socket, so silence is the only signal. Reconnect after 10 s of it.
+STALL_CHECK_INTERVAL_S = 5.0
+STALL_TIMEOUT_S = 10.0
+CONNECT_TIMEOUT_S = 10.0
+
 # Global configuration that will be set by command line args
 _global_config = {
     'mavlink2rest_url': 'http://host.docker.internal:6040',
@@ -439,8 +446,7 @@ class RTKController(Controller):
 
             # Debug credentials (mask password for security)
             if self._config.username or self._config.password:
-                masked_password = '*' * len(self._config.password) if self._config.password else '(empty)'
-                print(f"🔐 Using credentials: {self._config.username} / {masked_password}")
+                print("🔐 Using configured credentials")
             else:
                 print("🔓 No credentials provided (anonymous access)")
 
@@ -448,7 +454,7 @@ class RTKController(Controller):
             try:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port),
-                    timeout=30.0  # 30 second connection timeout
+                    timeout=CONNECT_TIMEOUT_S
                 )
                 print(f"✅ TCP connection established to {host}:{port}")
 
@@ -468,40 +474,13 @@ class RTKController(Controller):
                 except Exception as e:
                     print(f"⚠️  Could not enable TCP keepalive: {e}")
             except asyncio.TimeoutError:
-                raise Exception(f"Connection timeout to {host}:{port} (30 seconds)")
+                raise Exception(f"Connection timeout to {host}:{port} ({CONNECT_TIMEOUT_S:.0f} seconds)")
             except Exception as e:
                 raise Exception(f"Failed to connect to {host}:{port}: {e}")
 
             # Send NTRIP request
             auth = f"{self._config.username}:{self._config.password}"
             auth_encoded = base64.b64encode(auth.encode()).decode()
-
-            # Debug the exact credentials being encoded
-            print(f"🔍 Debug credential encoding:")
-            print(f"   Raw auth string length: {len(auth)} characters")
-            print(f"   Username length: {len(self._config.username)} characters")
-            print(f"   Password length: {len(self._config.password)} characters")
-
-            # Check for potentially problematic characters
-            special_chars = ['*', '@', '#', '$', '%', '^', '&', '!', '?', '<', '>', '{', '}', '[', ']', '\\', '/', '|', '~', '`']
-            found_special = [char for char in special_chars if char in self._config.password]
-            if found_special:
-                print(f"   ⚠️  Special characters found in password: {found_special}")
-
-            # Show a few characters of the base64 for verification (but not the whole thing for security)
-            auth_preview = auth_encoded[:12] + "..." + auth_encoded[-4:] if len(auth_encoded) > 16 else auth_encoded
-            print(f"   Base64 encoded (preview): {auth_preview}")
-
-            # Check for common encoding issues
-            try:
-                # Verify the base64 can be decoded back
-                decoded_check = base64.b64decode(auth_encoded).decode()
-                if decoded_check == auth:
-                    print(f"   ✅ Base64 encoding/decoding verified")
-                else:
-                    print(f"   ❌ Base64 encoding verification failed!")
-            except Exception as e:
-                print(f"   ❌ Base64 encoding error: {e}")
 
             # Debug the exact request being sent
             request = (f"GET /{self._config.mountpoint} HTTP/1.0\r\n"
@@ -514,12 +493,9 @@ class RTKController(Controller):
             print(f"   GET /{self._config.mountpoint} HTTP/1.0")
             print(f"   Host: {host}:{port}")
             print(f"   User-Agent: NTRIP BlueOS-RTK-Extension/1.0")
-            print(f"   Authorization: Basic {auth_encoded[:8]}...")
+            print(f"   Authorization: Basic <redacted>")
 
-            # Debug the exact bytes being sent
             request_bytes = request.encode()
-            print(f"📤 Raw request ({len(request_bytes)} bytes):")
-            print(f"   {repr(request_bytes)}")
 
             writer.write(request_bytes)
             await writer.drain()
@@ -610,7 +586,7 @@ class RTKController(Controller):
             total_mavlink_messages = 0
             failed_mavlink_sends = 0
             last_data_time = datetime.now()
-            read_timeout = 60.0  # 60 second timeout for data reads
+            read_timeout = STALL_CHECK_INTERVAL_S
 
             # Main data reading loop - ANY error here will trigger reconnection
             while True:
@@ -711,9 +687,9 @@ class RTKController(Controller):
                     time_since_data = (datetime.now() - last_data_time).total_seconds()
                     print(f"⏰ No data received for {time_since_data:.1f} seconds")
 
-                    if time_since_data > 120:  # More than 2 minutes without data
+                    if time_since_data >= STALL_TIMEOUT_S:
                         print(f"🔌 Connection appears stalled - triggering reconnection")
-                        raise Exception("Connection stalled - no data received for over 2 minutes")
+                        raise Exception(f"Connection stalled - no data received for {time_since_data:.0f} seconds")
                     else:
                         # Continue waiting for data
                         print(f"   Continuing to wait for data...")

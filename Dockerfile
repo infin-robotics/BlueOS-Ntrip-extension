@@ -13,7 +13,7 @@ RUN apt-get update \
 
 EXPOSE 8000/tcp
 
-LABEL version="0.0.5"
+LABEL version="0.0.5-infin.1"
 
 LABEL permissions='\
 {\
