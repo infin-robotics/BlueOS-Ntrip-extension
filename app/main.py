@@ -5,6 +5,7 @@ import requests
 import logging.handlers
 import json
 import socket
+import errno
 import base64
 import aiohttp
 import argparse
@@ -26,7 +27,26 @@ from pydantic import BaseModel
 # a half-open socket, so silence is the only signal. Reconnect after 10 s of it.
 STALL_CHECK_INTERVAL_S = 5.0
 STALL_TIMEOUT_S = 10.0
-CONNECT_TIMEOUT_S = 10.0
+CONNECT_TIMEOUT_S = 5.0     # Linux sends 3 SYNs (0, 1, 3 s) within this
+RESPONSE_TIMEOUT_S = 5.0    # casters answer within one round trip when they answer at all
+DNS_TIMEOUT_S = 3.0
+DNS_CACHE_MAX_AGE_S = 24 * 3600
+
+# Retry timing depends on where a failure happened. While our own link is down,
+# attempts never reach the caster, so retrying quickly costs nothing and catches
+# the link coming back. Once the caster is reachable but misbehaving, back off so
+# a public caster is not hammered.
+LINK_RETRY_S = 2.0
+CASTER_BACKOFF_S = (5.0, 10.0, 30.0)
+FATAL_BACKOFF_MAX_S = 30.0
+
+
+class LinkDownError(Exception):
+    """Our side cannot reach the caster: DNS, routing, connect timeout or a stalled stream."""
+
+
+class CasterError(Exception):
+    """The caster was reached but did not serve corrections."""
 
 # Global configuration that will be set by command line args
 _global_config = {
@@ -218,6 +238,7 @@ class RTKController(Controller):
         self._vehicle_location = None  # vehicle GPS location (lat, lon, alt) in decimal degrees and meters
         self._vehicle_location_update = 0  # system time (in sec since epoch) when vehicle location received
         self._connection_active = False  # True once a connection establishes and starts streaming RTCM
+        self._caster_addresses = {}  # (host, port) -> (address, monotonic time of last successful lookup)
 
     def _is_config_valid(self) -> bool:
         """Check if the current configuration is valid for connecting"""
@@ -315,14 +336,17 @@ class RTKController(Controller):
         self._ntrip_task = asyncio.create_task(self._ntrip_client_loop())
 
     @staticmethod
-    def _classify_ntrip_error(error_text: str) -> str:
+    def _classify_ntrip_error(error: Exception) -> str:
         """Classify a connection error to decide the retry strategy.
 
         Returns one of:
-          'fatal'     - configuration/credential problem; back off slowly, won't fix itself
-          'transient' - network/caster blip (timeout, reset, stall, caster startup); retry quickly
+          'fatal'  - configuration/credential problem; back off slowly, won't fix itself
+          'link'   - our link is down; attempts never reach the caster, retry quickly
+          'caster' - the caster was reached but failed; back off (also the default)
         """
-        err = error_text.lower()
+        if isinstance(error, LinkDownError):
+            return "link"
+        err = str(error).lower()
         fatal_markers = [
             "authentication failed",
             "not found",          # mountpoint missing (404)
@@ -331,14 +355,12 @@ class RTKController(Controller):
         ]
         if any(marker in err for marker in fatal_markers):
             return "fatal"
-        return "transient"
+        return "caster"
 
     async def _ntrip_client_loop(self):
         """Main NTRIP client loop - retries on ALL errors and disconnections"""
-        base_reconnect_delay = 5         # starting/fast retry delay (seconds)
-        transient_reconnect_delay = 5    # fixed fast retry for network/caster blips
-        max_reconnect_delay = 30         # cap retry delay (was 300 - too slow for RTK)
-        reconnect_delay = base_reconnect_delay
+        fatal_delay = CASTER_BACKOFF_S[0]
+        caster_failures = 0   # consecutive caster-side failures; link failures do not reset it
         consecutive_failures = 0
 
         print("🔄 Starting NTRIP client loop with automatic reconnection")
@@ -381,7 +403,8 @@ class RTKController(Controller):
                 # rather than escalating toward the cap after a brief good connection.
                 if self._connection_active:
                     consecutive_failures = 0
-                    reconnect_delay = base_reconnect_delay
+                    caster_failures = 0
+                    fatal_delay = CASTER_BACKOFF_S[0]
 
                 consecutive_failures += 1
 
@@ -391,14 +414,16 @@ class RTKController(Controller):
                 self._status.last_update = datetime.now().isoformat()
 
                 # Choose retry strategy based on the kind of failure
-                error_class = self._classify_ntrip_error(str(e))
+                error_class = self._classify_ntrip_error(e)
                 if error_class == "fatal":
                     # Real config/credential issue - it won't self-heal, so back off slowly
-                    reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+                    reconnect_delay = fatal_delay
+                    fatal_delay = min(fatal_delay * 1.5, FATAL_BACKOFF_MAX_S)
+                elif error_class == "link":
+                    reconnect_delay = LINK_RETRY_S
                 else:
-                    # Network/caster blip (timeout, ECONNRESET, stall, caster startup):
-                    # retry quickly to catch the next good window from the caster
-                    reconnect_delay = transient_reconnect_delay
+                    reconnect_delay = CASTER_BACKOFF_S[min(caster_failures, len(CASTER_BACKOFF_S) - 1)]
+                    caster_failures += 1
 
                 # Log the error and retry information
                 print(f"❌ NTRIP connection failed (attempt #{consecutive_failures}, {error_class})")
@@ -424,6 +449,30 @@ class RTKController(Controller):
                     break
 
         print("🏁 NTRIP client loop terminated")
+
+    async def _resolve_caster(self, host: str, port: int) -> str:
+        """Resolve the caster, falling back to the last good address for up to a day.
+
+        Right after a satellite link returns, DNS can fail or hang for longer than
+        the link takes to recover. The cached address is only used when a lookup
+        fails, so a moved caster is picked up as soon as DNS answers again.
+        """
+        loop = asyncio.get_running_loop()
+        lookup = asyncio.ensure_future(loop.getaddrinfo(host, port, type=socket.SOCK_STREAM))
+        # Consume the result even if we stop waiting, so a late failure is not logged as unretrieved.
+        lookup.add_done_callback(lambda f: f.cancelled() or f.exception())
+        try:
+            infos = await asyncio.wait_for(asyncio.shield(lookup), timeout=DNS_TIMEOUT_S)
+            address = infos[0][4][0]
+            self._caster_addresses[(host, port)] = (address, time.monotonic())
+            return address
+        except Exception as e:
+            reason = "timed out" if isinstance(e, asyncio.TimeoutError) else str(e)
+            cached = self._caster_addresses.get((host, port))
+            if cached and time.monotonic() - cached[1] < DNS_CACHE_MAX_AGE_S:
+                print(f"⚠️  DNS lookup for {host} failed ({reason}); using last known address")
+                return cached[0]
+            raise LinkDownError(f"DNS lookup for {host} failed: {reason}")
 
     async def _connect_ntrip(self):
         """Connect to NTRIP caster and forward RTCM data - raises exception on ANY error"""
@@ -451,9 +500,10 @@ class RTKController(Controller):
                 print("🔓 No credentials provided (anonymous access)")
 
             # Connect to NTRIP caster with timeout
+            address = await self._resolve_caster(host, port)
             try:
                 reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port),
+                    asyncio.open_connection(address, port),
                     timeout=CONNECT_TIMEOUT_S
                 )
                 print(f"✅ TCP connection established to {host}:{port}")
@@ -474,9 +524,13 @@ class RTKController(Controller):
                 except Exception as e:
                     print(f"⚠️  Could not enable TCP keepalive: {e}")
             except asyncio.TimeoutError:
-                raise Exception(f"Connection timeout to {host}:{port} ({CONNECT_TIMEOUT_S:.0f} seconds)")
-            except Exception as e:
-                raise Exception(f"Failed to connect to {host}:{port}: {e}")
+                raise LinkDownError(f"Connection timeout to {host}:{port} ({CONNECT_TIMEOUT_S:.0f} seconds)")
+            except ConnectionRefusedError as e:
+                raise CasterError(f"Connection refused by {host}:{port}: {e}")
+            except OSError as e:
+                if e.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN):
+                    raise LinkDownError(f"Failed to connect to {host}:{port}: {e}")
+                raise CasterError(f"Failed to connect to {host}:{port}: {e}")
 
             # Send NTRIP request
             auth = f"{self._config.username}:{self._config.password}"
@@ -504,11 +558,11 @@ class RTKController(Controller):
             # Read response header with timeout
             print(f"📥 Reading server response...")
             try:
-                response = await asyncio.wait_for(reader.readline(), timeout=30.0)
+                response = await asyncio.wait_for(reader.readline(), timeout=RESPONSE_TIMEOUT_S)
                 response_str = response.decode(errors="replace").strip()
                 print(f"📥 Server response: {response_str}")
             except asyncio.TimeoutError:
-                raise Exception("Timeout waiting for server response (30 seconds)")
+                raise CasterError(f"Timeout waiting for server response ({RESPONSE_TIMEOUT_S:.0f} seconds)")
 
             # Check response - handle both NTRIP v1 (ICY 200 OK) and v2 (HTTP/1.x 200 OK)
             response_is_ok = (b"200 OK" in response or b"ICY 200 OK" in response)
@@ -553,7 +607,7 @@ class RTKController(Controller):
                 print(f"📥 Reading response headers...")
                 header_count = 0
                 while True:
-                    line = await asyncio.wait_for(reader.readline(), timeout=30.0)
+                    line = await asyncio.wait_for(reader.readline(), timeout=RESPONSE_TIMEOUT_S)
                     if not line or line in (b'\r\n', b'\n'):
                         break
                     if line[0] == 0xD3:
@@ -701,7 +755,7 @@ class RTKController(Controller):
 
                     if time_since_data >= STALL_TIMEOUT_S:
                         print(f"🔌 Connection appears stalled - triggering reconnection")
-                        raise Exception(f"Connection stalled - no data received for {time_since_data:.0f} seconds")
+                        raise LinkDownError(f"Connection stalled - no data received for {time_since_data:.0f} seconds")
                     else:
                         # Continue waiting for data
                         print(f"   Continuing to wait for data...")

@@ -13,7 +13,10 @@ RUN apt-get update \
 
 EXPOSE 8000/tcp
 
-LABEL version="0.0.5-infin.2"
+# Write logs as they happen so docker log timestamps match the events.
+ENV PYTHONUNBUFFERED=1
+
+LABEL version="0.0.5-infin.3"
 
 LABEL permissions='\
 {\
